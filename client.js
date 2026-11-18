@@ -15,11 +15,15 @@ window.__ModuleLoader__.load({
     const CACHE_KEY = 'dsh.api-credits.rates.v1';
     const LOCAL_KEY = 'dsh.api-credits.local-currency.v1';
     const SPEND_KEY = 'dsh.api-credits.spend-mode.v1';
+    const TREE_KEY = 'dsh.api-credits.tree-scope.v1';
     const RATE_TTL_MS = 30 * 60 * 1000;
     const RATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
     const ATTEMPT_TIMEOUT_MS = 4500;
     const RACE_DEADLINE_MS = 8000;
     const BALANCE_TTL_MS = 60 * 1000;
+    const SPEND_TTL_MS = 4 * 1000;
+    const SPEND_POLL_MS = 10 * 1000;
+    const SPEND_KEEP = 20;
 
     //#region locale
     const DICTS = {
@@ -55,6 +59,17 @@ window.__ModuleLoader__.load({
         spendIn: 'Session spend in',
         spendLocal: 'Local',
         spendTopUp: 'Top-up',
+        subagents: 'Subagents',
+        sessionSubtotal: 'This session',
+        subagentsSubtotal: 'Subagents total',
+        otherAgents: 'Other agents',
+        externalUnmeasured: 'Not measured: external agents',
+        childLogsMissing: 'Unavailable: child sessions',
+        treeTruncated: 'Truncated: agent limit reached',
+        includeSubagents: 'Whole tree',
+        onlyThisSession: 'This session',
+        spendWithSubagents: 'Session spend including subagents',
+        treeScopeAria: 'Subagent spend accounting',
       },
       ru: {
         nav: 'API-кредиты',
@@ -88,6 +103,17 @@ window.__ModuleLoader__.load({
         spendIn: 'Расход сессии в',
         spendLocal: 'Локальная',
         spendTopUp: 'Пополнение',
+        subagents: 'Субагенты',
+        sessionSubtotal: 'Своя сессия',
+        subagentsSubtotal: 'Итого субагенты',
+        otherAgents: 'Остальные агенты',
+        externalUnmeasured: 'Не измеряются: внешние агенты',
+        childLogsMissing: 'Недоступны: дочерние сессии',
+        treeTruncated: 'Сокращено: достигнут лимит агентов',
+        includeSubagents: 'Всё дерево',
+        onlyThisSession: 'Только эта',
+        spendWithSubagents: 'Расход сессии с субагентами',
+        treeScopeAria: 'Учёт расхода субагентов',
       },
       zh: {
         nav: 'API 额度',
@@ -121,6 +147,17 @@ window.__ModuleLoader__.load({
         spendIn: '会话消耗显示为',
         spendLocal: '本地货币',
         spendTopUp: '充值货币',
+        subagents: '子代理',
+        sessionSubtotal: '本会话',
+        subagentsSubtotal: '子代理合计',
+        otherAgents: '其他代理',
+        externalUnmeasured: '未计量：外部代理',
+        childLogsMissing: '不可用：子会话',
+        treeTruncated: '已截断：达到代理上限',
+        includeSubagents: '整棵树',
+        onlyThisSession: '仅本会话',
+        spendWithSubagents: '会话消耗（含子代理）',
+        treeScopeAria: '子代理消耗统计',
       },
     };
     //#endregion
@@ -531,6 +568,28 @@ window.__ModuleLoader__.load({
       if (value >= 1e3) return Math.round(value / 1e3) + 'K';
       return String(value);
     }
+
+    /** One agent's readable label: its name, its catalog label, then a short id. */
+    function agentLabel(agent) {
+      if (agent && typeof agent.name === 'string' && agent.name !== '') return agent.name;
+      if (agent && typeof agent.label === 'string' && agent.label !== '') return agent.label;
+      const id = agent && typeof agent.id === 'string' ? agent.id : '';
+      return id.indexOf('session-') === 0 ? id.slice(8, 16) : id.slice(0, 8);
+    }
+
+    /** Fold every child's four buckets into one raw usage object. */
+    function foldAgentUsage(agents) {
+      const total = { uncachedInputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+      for (const agent of agents || []) {
+        const usage = agent && agent.usage;
+        if (!usage) continue;
+        total.uncachedInputTokens += Number(usage.uncachedInputTokens) || 0;
+        total.cacheWriteTokens += Number(usage.cacheWriteTokens) || 0;
+        total.cacheReadTokens += Number(usage.cacheReadTokens) || 0;
+        total.outputTokens += Number(usage.outputTokens) || 0;
+      }
+      return total;
+    }
     //#endregion
 
     /** The wallet the account tops up in: its largest one, CNY on a tie. */
@@ -594,6 +653,7 @@ window.__ModuleLoader__.load({
         this.timers = new Set();
         this.rateInFlight = null;
         this.balanceInFlight = null;
+        this.spendInFlight = new Map();
         this.onWindowFocus = () => {
           this.refreshRates(false);
           this.refreshBalance();
@@ -611,6 +671,9 @@ window.__ModuleLoader__.load({
           providerStatus: {},
           localCurrency: DEFAULT_LOCAL_CURRENCY,
           spendMode: 'topup',
+          treeScope: 'tree',
+          spend: {},
+          spendDiag: '',
         };
         this.subscribe = (listener) => {
           this.listeners.add(listener);
@@ -683,17 +746,19 @@ window.__ModuleLoader__.load({
         this.refreshBalance();
       }
 
-      /** The local currency and the spend-currency choice survive reloads. */
+      /** The local currency, the spend-currency choice, and the tree scope survive reloads. */
       readPrefs() {
         try {
           const local = window.localStorage.getItem(LOCAL_KEY);
           const mode = window.localStorage.getItem(SPEND_KEY);
+          const tree = window.localStorage.getItem(TREE_KEY);
           return {
             localCurrency: LOCAL_CURRENCIES.includes(local) ? local : DEFAULT_LOCAL_CURRENCY,
             spendMode: mode === 'local' ? 'local' : 'topup',
+            treeScope: tree === 'self' ? 'self' : 'tree',
           };
         } catch (error) {
-          return { localCurrency: DEFAULT_LOCAL_CURRENCY, spendMode: 'topup' };
+          return { localCurrency: DEFAULT_LOCAL_CURRENCY, spendMode: 'topup', treeScope: 'tree' };
         }
       }
 
@@ -718,6 +783,65 @@ window.__ModuleLoader__.load({
         } catch (error) {
           /* storage disabled: the choice still applies for this page */
         }
+      }
+
+      /** Whether the pill prices the whole subagent tree or this session alone. */
+      setTreeScope(scope) {
+        const next = scope === 'self' ? 'self' : 'tree';
+        if (next === this.state.treeScope) return;
+        this.emit({ treeScope: next });
+        try {
+          window.localStorage.setItem(TREE_KEY, next);
+        } catch (error) {
+          /* storage disabled: the choice still applies for this page */
+        }
+      }
+
+      /**
+       * Read the Host's tree aggregate for one Session. The reply carries raw
+       * buckets per node; money stays a Client concern. Failures leave the pill
+       * on its own `tokenUsage` readout and are surfaced only as a diagnostic.
+       */
+      refreshSpend(sessionId, force) {
+        if (!sessionId) return Promise.resolve();
+        const inflight = this.spendInFlight.get(sessionId);
+        if (inflight !== undefined) return inflight;
+        const cached = this.state.spend[sessionId];
+        if (force !== true && cached !== undefined && Date.now() - cached.at < SPEND_TTL_MS) {
+          return Promise.resolve();
+        }
+        const run = (async () => {
+          try {
+            const token = typeof window !== 'undefined' ? window.__DSH_API_CREDITS_TOKEN__ : undefined;
+            if (!token) return;
+            const query = new URLSearchParams({ t: token, session: sessionId });
+            const response = await fetch('/api-credits/spend?' + query.toString(), { cache: 'no-store' });
+            if (!response.ok) {
+              this.emit({ spendDiag: 'spend: HTTP ' + response.status });
+              return;
+            }
+            const payload = await response.json();
+            if (!payload || payload.ok !== true) {
+              this.emit({ spendDiag: 'spend: ' + (payload && payload.reason ? payload.reason : 'failed') });
+              return;
+            }
+            const spend = { ...this.state.spend, [sessionId]: { at: Date.now(), payload } };
+            const ids = Object.keys(spend);
+            if (ids.length > SPEND_KEEP) {
+              ids
+                .sort((left, right) => (spend[left].at || 0) - (spend[right].at || 0))
+                .slice(0, ids.length - SPEND_KEEP)
+                .forEach((id) => delete spend[id]);
+            }
+            this.emit({ spend, spendDiag: '' });
+          } catch (error) {
+            this.emit({ spendDiag: 'spend: ' + describeError(error) });
+          } finally {
+            this.spendInFlight.delete(sessionId);
+          }
+        })();
+        this.spendInFlight.set(sessionId, run);
+        return run;
       }
 
       readCache() {
@@ -1070,23 +1194,64 @@ window.__ModuleLoader__.load({
     /**
      * Session spend: the whole-log token usage folded through the billing
      * buckets, so cache hits are priced at the hit rate instead of the miss rate.
-     * The currency follows the Settings choice: the local currency (converted
-     * from the CNY table) or the currency the balance is actually topped up in.
+     *
+     * With `treeScope: 'tree'` the pill adds every subagent's spend, read from
+     * the Host aggregate (`/api-credits/spend`): a subagent is a separate
+     * Session, so this Session's `tokenUsage` cannot see it. When the aggregate
+     * is unavailable the pill silently keeps the own-session figure, which is
+     * exactly the previous behaviour.
      */
-    function SpendPill({ credits, t, useProjection }) {
+    function SpendPill({ credits, t, useProjection, sessionId, useSession }) {
       const state = useCredits(credits);
       const [open, setOpen] = React.useState(false);
       const anchorRef = React.useRef(null);
       const usage = typeof useProjection === 'function' ? useProjection('tokenUsage') : undefined;
+      const catalog = typeof useProjection === 'function' ? useProjection('subagentCatalog') : undefined;
+      const sessionRunning = typeof useSession === 'function' ? useSession((snapshot) => !!(snapshot && snapshot.running)) : undefined;
       const localeTag = credits.localeTag();
 
-      if (!usage) return null;
-      const buckets = sessionBuckets(usage, Date.now());
-      const billed = buckets.fresh + buckets.write + buckets.hit + buckets.out;
+      const includeTree = state.treeScope !== 'self';
+      const tree = includeTree && sessionId ? state.spend[sessionId] : undefined;
+      const catalogLength = Array.isArray(catalog) ? catalog.length : 0;
+
+      // A new child shows up in the live catalog projection; a finished turn
+      // means children likely settled. Both are cheaper and more exact than a
+      // permanent timer.
+      React.useEffect(() => {
+        if (!includeTree || !sessionId) return;
+        credits.refreshSpend(sessionId, false);
+      }, [includeTree, sessionId, catalogLength]);
+
+      React.useEffect(() => {
+        if (!includeTree || !sessionId || sessionRunning !== false) return;
+        credits.refreshSpend(sessionId, true);
+      }, [includeTree, sessionId, sessionRunning]);
+
+      const anyRunning = !!(tree && tree.payload && tree.payload.anyRunning);
+      React.useEffect(() => {
+        if (!includeTree || !sessionId || !anyRunning) return;
+        const timer = setInterval(() => credits.refreshSpend(sessionId, true), SPEND_POLL_MS);
+        return () => clearInterval(timer);
+      }, [includeTree, sessionId, anyRunning]);
+
+      const ownBuckets = usage
+        ? sessionBuckets(usage, Date.now())
+        : tree
+          ? sessionBuckets(tree.payload.own, Date.now())
+          : null;
+      if (!ownBuckets) return null;
+
+      const payload = tree && tree.payload && Array.isArray(tree.payload.agents) ? tree.payload : null;
+      const hasTree = !!(payload && payload.agents.length > 0);
+      const totalsBuckets = hasTree ? sessionBuckets(payload.totals, Date.now()) : ownBuckets;
+      // Inside one tree reply the parts must add up to the total, so the own part
+      // comes from the same snapshot as the totals, not from the live projection.
+      const ownPartBuckets = hasTree ? sessionBuckets(payload.own, Date.now()) : ownBuckets;
+      const billed = totalsBuckets.fresh + totalsBuckets.write + totalsBuckets.hit + totalsBuckets.out;
       if (billed === 0) return null;
 
-      const family = PRICES[buckets.family];
-      const factor = buckets.peak ? 2 : 1;
+      const family = PRICES[ownBuckets.family];
+      const factor = totalsBuckets.peak ? 2 : 1;
       const localCode = state.localCurrency || DEFAULT_LOCAL_CURRENCY;
       const rawLocal = state.rate && state.rate.rates ? state.rate.rates[localCode] : undefined;
       const localRate = Number.isFinite(rawLocal) && rawLocal > 0 ? rawLocal : null;
@@ -1103,11 +1268,80 @@ window.__ModuleLoader__.load({
         table = family[currency === 'USD' ? 'USD' : 'CNY'];
       }
 
-      const value = spendValue(buckets, table, factor) * convert;
-      const cnyValue = spendValue(buckets, family.CNY, factor);
-      const cost = formatCost(value, currency, localeTag);
-      const summary = cost;
+      const money = (buckets) => spendValue(buckets, table, factor) * convert;
+      const cost = formatCost(money(totalsBuckets), currency, localeTag);
+      const ownCost = money(ownPartBuckets);
+      const cnyValue = spendValue(totalsBuckets, family.CNY, factor);
       const unit = (price) => formatMoney(price * factor * convert, currency, localeTag) + '/1M';
+
+      const agentUsage = hasTree ? foldAgentUsage(payload.agents) : null;
+      const agentBuckets = agentUsage ? sessionBuckets(agentUsage, Date.now()) : null;
+      const agentCost = agentBuckets ? money(agentBuckets) : 0;
+      const agentRows = hasTree
+        ? payload.agents
+            .map((agent) => ({ agent, value: money(sessionBuckets(agent.usage || {}, Date.now())) }))
+            .sort((left, right) => right.value - left.value)
+        : [];
+      const shownRows = agentRows.slice(0, 5);
+      const restCost = Math.max(0, agentCost - shownRows.reduce((sum, row) => sum + row.value, 0));
+
+      const tip = [];
+      tip.push(h('div', { className: 'dshac-tipTitle', key: 'title' }, t('sessionSpend')));
+      tip.push(h(TipRow, { key: 'new', label: t('tokensNew'), value: compactTokens(totalsBuckets.fresh) + ' × ' + unit(table.miss) }));
+      if (totalsBuckets.write > 0) {
+        tip.push(h(TipRow, { key: 'write', label: t('tokensWrite'), value: compactTokens(totalsBuckets.write) + ' × ' + unit(table.miss) }));
+      }
+      tip.push(h(TipRow, { key: 'hit', label: t('tokensHit'), value: compactTokens(totalsBuckets.hit) + ' × ' + unit(table.hit) }));
+      tip.push(h(TipRow, { key: 'out', label: t('tokensOut'), value: compactTokens(totalsBuckets.out) + ' × ' + unit(table.output) }));
+      tip.push(h('div', { className: 'dshac-tipRule', key: 'rule-total' }));
+      tip.push(h(TipRow, { key: 'total', label: t('total'), value: cost }));
+
+      if (hasTree) {
+        tip.push(h('div', { className: 'dshac-tipRule', key: 'rule-parts' }));
+        tip.push(h(TipRow, { key: 'own', label: t('sessionSubtotal'), value: formatCost(ownCost, currency, localeTag) }));
+        tip.push(
+          h(TipRow, {
+            key: 'agents',
+            label: t('subagents') + ' · ' + payload.agents.length,
+            value: formatCost(agentCost, currency, localeTag),
+          }),
+        );
+        for (const row of shownRows) {
+          tip.push(h(TipRow, { key: 'agent:' + row.agent.id, label: agentLabel(row.agent), value: formatCost(row.value, currency, localeTag) }));
+        }
+        if (agentRows.length > shownRows.length) {
+          tip.push(
+            h(TipRow, {
+              key: 'agents-rest',
+              label: t('otherAgents') + ' · ' + (agentRows.length - shownRows.length),
+              value: formatCost(restCost, currency, localeTag),
+            }),
+          );
+        }
+      }
+
+      if (currency !== 'CNY') {
+        tip.push(h(TipRow, { key: 'cny', label: t('inCny'), value: formatCost(cnyValue, 'CNY', localeTag) }));
+      }
+      if (state.spendMode === 'local' && localRate === null) {
+        tip.push(h('div', { className: 'dshac-tipNote', key: 'norate' }, t('rateUnavailable')));
+      }
+      if (hasTree && payload.externals.length > 0) {
+        tip.push(h('div', { className: 'dshac-tipNote', key: 'external' }, t('externalUnmeasured') + ' · ' + payload.externals.length));
+      }
+      if (hasTree && payload.missing.length > 0) {
+        tip.push(h('div', { className: 'dshac-tipNote', key: 'missing' }, t('childLogsMissing') + ' · ' + payload.missing.length));
+      }
+      if (hasTree && payload.truncated) {
+        tip.push(h('div', { className: 'dshac-tipNote', key: 'truncated' }, t('treeTruncated')));
+      }
+      tip.push(
+        h(
+          'div',
+          { className: 'dshac-tipNote', key: 'tariff' },
+          t('tariff') + ' ' + family.id + ' · ' + (totalsBuckets.peak ? t('peak') : t('offPeak')),
+        ),
+      );
 
       return h(
         'span',
@@ -1116,7 +1350,7 @@ window.__ModuleLoader__.load({
           ref: anchorRef,
           tabIndex: 0,
           role: 'note',
-          'aria-label': t('spendAria') + ': ' + summary,
+          'aria-label': (hasTree ? t('spendWithSubagents') : t('spendAria')) + ': ' + cost,
           onMouseEnter: () => setOpen(true),
           onMouseLeave: () => setOpen(false),
           onFocus: () => setOpen(true),
@@ -1127,25 +1361,9 @@ window.__ModuleLoader__.load({
           { className: 'dshac-pill', 'data-composer-stat': 'api-credits-spend' },
           h(SpendIcon),
           h('span', { className: 'dshac-label' }, '−' + cost),
+          hasTree && h('span', { className: 'dshac-sub', 'aria-hidden': 'true' }, '+' + payload.agents.length),
         ),
-        h(
-          Tooltip,
-          { open, anchorRef },
-          h('div', { className: 'dshac-tipTitle' }, t('sessionSpend')),
-          h(TipRow, { label: t('tokensNew'), value: compactTokens(buckets.fresh) + ' × ' + unit(table.miss) }),
-          buckets.write > 0 && h(TipRow, { label: t('tokensWrite'), value: compactTokens(buckets.write) + ' × ' + unit(table.miss) }),
-          h(TipRow, { label: t('tokensHit'), value: compactTokens(buckets.hit) + ' × ' + unit(table.hit) }),
-          h(TipRow, { label: t('tokensOut'), value: compactTokens(buckets.out) + ' × ' + unit(table.output) }),
-          h('div', { className: 'dshac-tipRule' }),
-          h(TipRow, { label: t('total'), value: cost }),
-          currency !== 'CNY' && h(TipRow, { label: t('inCny'), value: formatCost(cnyValue, 'CNY', localeTag) }),
-          state.spendMode === 'local' && localRate === null && h('div', { className: 'dshac-tipNote' }, t('rateUnavailable')),
-          h(
-            'div',
-            { className: 'dshac-tipNote' },
-            t('tariff') + ' ' + family.id + ' · ' + (buckets.peak ? t('peak') : t('offPeak')),
-          ),
-        ),
+        h(Tooltip, { open, anchorRef }, tip),
       );
     }
 
@@ -1218,6 +1436,9 @@ window.__ModuleLoader__.load({
       if (state.balanceDiag) {
         children.push(h('div', { className: 'dshac-diag', key: 'diag' }, state.balanceDiag));
       }
+      if (state.spendDiag) {
+        children.push(h('div', { className: 'dshac-diag', key: 'spend-diag' }, state.spendDiag));
+      }
 
       children.push(
         h(
@@ -1261,6 +1482,33 @@ window.__ModuleLoader__.load({
                 onClick: () => credits.setSpendMode('topup'),
               },
               t('spendTopUp') + ' (' + currencySymbol(topUpCurrency(state), localeTag) + ')',
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { className: 'dshac-row', key: 'tree-scope' },
+          h('span', {}, t('subagents')),
+          h(
+            'span',
+            { className: 'dshac-segment', role: 'group', 'aria-label': t('treeScopeAria') },
+            h(
+              'button',
+              {
+                type: 'button',
+                'aria-pressed': state.treeScope === 'tree' ? 'true' : 'false',
+                onClick: () => credits.setTreeScope('tree'),
+              },
+              t('includeSubagents'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                'aria-pressed': state.treeScope === 'self' ? 'true' : 'false',
+                onClick: () => credits.setTreeScope('self'),
+              },
+              t('onlyThisSession'),
             ),
           ),
         ),
@@ -1342,6 +1590,7 @@ window.__ModuleLoader__.load({
 .dshac-anchor:hover .dshac-pill,.dshac-anchor:focus-visible .dshac-pill{background:var(--dsw-alias-interactive-bg-hover,transparent);color:var(--dsw-alias-label-secondary)}
 .dshac-anchor:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px;border-radius:var(--dsw-radius-sm,6px)}
 .dshac-label{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.dshac-sub{margin-left:2px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}
 .dshac-tip{box-sizing:border-box;width:max-content;min-width:260px;max-width:min(360px,calc(100vw - 16px));padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2,var(--dsw-alias-border-l1));border-radius:var(--dsw-radius-lg,10px);background-color:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base,#1b1b1d)));box-shadow:var(--dsw-elevation-prominent,0 10px 28px rgba(0,0,0,.32));color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;cursor:default}
 .dshac-tipInline{position:absolute;left:0;bottom:calc(100% + 8px);z-index:30}
 .dshac-tipTitle{margin-bottom:6px;color:var(--dsw-alias-label-primary);font-weight:500}

@@ -3,7 +3,7 @@
   "version": "1.0.1",
   "private": true,
   "type": "module",
-  "description": "DSH plugin: API credit balance and cache-aware session spend, converted from CNY to USD and a chosen local currency at live exchange rates.",
+  "description": "DSH plugin: API credit balance and cache-aware session spend including subagent trees, converted from CNY to USD and a chosen local currency at live exchange rates.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -24,12 +24,17 @@
   ],
   "exports": {
     ".": "./index.js",
+    "./spend": "./spend.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "scripts": {
+    "test": "node --test test/spend.test.mjs"
+  },
   "files": [
     "index.js",
+    "spend.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",

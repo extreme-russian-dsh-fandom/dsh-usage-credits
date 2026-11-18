@@ -1,17 +1,17 @@
 # DSH Usage & Credits
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that shows your **API credit balance** and the **credit spend of the current session** right under the composer — in CNY, USD and your own local currency, at live exchange rates.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that shows your **API credit balance** and the **credit spend of the current session — including every subagent it spawned** — right under the composer, in CNY, USD and your own local currency, at live exchange rates.
 
-> The balance is what is left in your DeepSeek account. The spend is what this particular conversation has already consumed, priced by the actual billing buckets, including cache hits.
+> The balance is what is left in your DeepSeek account. The spend is what this conversation has already consumed, priced by the actual billing buckets, including cache hits — and, unlike a bare session counter, it also counts the child agents that did the work.
 
 ## What you get
 
 | Where | What |
 |---|---|
 | Composer dock | `¥12.34 ($1.85, 151 ₽)` — topped-up balance: yuan first, then dollars and your local currency |
-| Composer dock | `−¥0.65` — session spend, with a receipt icon; hover for the full breakdown |
-| Tooltip | Rate source, `¥1 = … ₽`, `$1 = … ¥`, refresh time, cache state, which providers answered |
-| Settings → API Credits | Balance in its native wallets (`¥12.34 + $1.85`), the local-currency equivalent, local currency picker, spend-currency switch, rate details, refresh button |
+| Composer dock | `−¥2.91 +18` — whole-tree spend with a receipt icon; `+18` marks the number of subagent sessions; hover for the full breakdown |
+| Tooltip | Billing buckets, total, this session vs subagents, the five most expensive agents, external agents that cannot be measured, cache state |
+| Settings → API Credits | Balance in its native wallets (`¥12.34 + $1.85`), the local-currency equivalent, local currency picker, spend-currency switch, subagent accounting switch, rate details, refresh button |
 
 The balance pill follows the same visual language as DSH's own `N tok` pills: same row, same spacing, same typography, theme tokens only.
 
@@ -35,6 +35,19 @@ cost = (uncachedInput + cacheWrite) × miss
 
 Real numbers from a 13.9M-token session with a 99% cache hit rate: **¥0.65**, while "everything at miss price" would claim ¥27.80 — a 42× overestimate.
 
+## Subagents count too
+
+A subagent is a separate DSH session with its own log, so this session's `tokenUsage` projection cannot see it. The pill therefore asks the Host for the whole tree:
+
+* the Host walks the durable `subagentCatalog` of the session, reads each child's `tokenUsage` through `ctx.sessionQuery.inspectSession` (no Agent is activated and no model call is made), and adds the four billing buckets up;
+* a cold child is read once and cached for 5 minutes; a finished tree reply is cached for 4 seconds;
+* a `subagent_fork` child is seeded with a prefix of its parent's log, and its own `tokenUsage` already includes that prefix — such a node is priced from its own log suffix only, so the parent's history is never counted twice;
+* external agents (ACP, Codex, Claude Code) have no local DSH log at all; the tooltip labels them as not measured instead of silently dropping them.
+
+The tooltip splits the number into this session, all subagents, and the five most expensive agents. If the aggregate is unavailable — an older Host, a disabled route, a read failure — the pill keeps showing this session alone, exactly as before.
+
+Measured on a real fan-out in this installation: the orchestrator's own spend was ¥1.089, its 18 children ¥3.158, the whole tree ¥4.247. The single-session figure was 26% of the bill.
+
 ## Pricing
 
 Official DeepSeek prices per 1M tokens. Off-peak is listed first, peak hours cost exactly double:
@@ -56,8 +69,9 @@ Two controls live on the settings page:
 
 * **Local currency** — 60 common fiat currencies (RUB by default, KZT, BYN, EUR, GEL, AMD, TRY, AED, INR, JPY, KRW, …). Names come from `Intl.DisplayNames`, symbols from `Intl.NumberFormat`, so nothing is hardcoded per currency.
 * **Session spend in** — `Local` (converted from the CNY price list at the live cross-rate, with the CNY equivalent shown in the tooltip) or `Top-up` (the currency of the largest wallet, CNY or USD, priced from its own official list).
+* **Subagents** — `Whole tree` (default) counts every child agent; `This session` restores the orchestrator-only number.
 
-Both choices are stored in `localStorage`, per browser.
+All choices are stored in `localStorage`, per browser.
 
 ## Exchange rates
 
@@ -83,6 +97,8 @@ Two transports, in order:
 
 Either way the balance never leaves your machine: the browser talks to your local DSH host, which talks to the DeepSeek platform with your own credentials.
 
+The Host half serves one more route on the same guard: `/api-credits/spend?session=…` returns raw billing buckets per session in the tree. The browser prices them, so the currency logic and the price list stay in one place.
+
 ## Install
 
 The repository root **is** the bundle, and the package is a normal pnpm dependency, so a GitHub ref and a local checkout both work. In Desktop, open the Plugin Manager and install it straight from the repository link — `https://github.com/extreme-russian-dsh-fandom/dsh-usage-credits` — or from a shell:
@@ -99,7 +115,7 @@ dsh plugin --profile <profile> add C:\path\to\dsh-usage-credits
 
 A local checkout is linked rather than copied, so `git pull` there reaches the running plugin after a page reload; a Git install is a fetched copy, and moving it to a newer ref means reinstalling.
 
-The bundle patch inserts one row, `api-credits`. It has no dependencies and no build step: the Host half registers the token-guarded balance route, the Client half registers both dock pills and the Settings page.
+The bundle patch inserts one row, `api-credits`. It has no dependencies and no build step: the Host half registers the token-guarded balance and spend routes, the Client half registers both dock pills and the Settings page.
 
 Requires a signed-in DeepSeek account for the balance; without one the plugin shows a sign-in hint and still displays the rate.
 
@@ -108,16 +124,21 @@ Requires a signed-in DeepSeek account for the balance; without one the plugin sh
 ```
 package.json        bundle manifest: dsh.bundle.patch + dsh.client
 cordis.patch.yml    inserts the `api-credits` row
-index.js            Host half: token-guarded balance route, index injection
-client.js           Client half: rate store, two dock pills, settings page
+index.js            Host half: token-guarded balance and spend routes, index injection
+spend.js            Host half: subagent tree aggregation (catalog walk, bucket fold, caches)
+client.js           Client half: rate store, spend store, two dock pills, settings page
 locale/{en,ru,zh}.json
 icon.svg
+test/spend.test.mjs unit tests for the tree aggregation
 ```
 
 ## Limitations
 
 * Prices are a snapshot of the official price list; DeepSeek may change them. They live in one `PRICES` table in `client.js`.
 * Peak-band estimation ignores Chinese public holidays and treats a session as if it ran entirely in the current band.
+* External subagent providers (ACP, Codex, Claude Code) report no usage to DSH, so their cost cannot be counted; the tooltip labels them instead.
+* A child whose log is gone — deleted, or an ephemeral caller-delivery workflow session — can only be counted while it is visible; the tooltip marks unavailable children.
+* Trees larger than 300 agents or 6 levels deep are counted partially and labelled as truncated.
 * Settings are stored per browser, not in the profile.
 * Balance and spend are estimates for your own accounting; the authoritative number is the one Platform charges.
 

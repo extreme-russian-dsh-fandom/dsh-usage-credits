@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "API Credits",
-    "description": "Shows the API credit balance in the composer dock and Settings, with live CNY, USD and RUB conversion."
+    "description": "Shows the API credit balance and the session's spend — subagents included — in the composer dock and Settings, with live CNY, USD and local-currency conversion."
   }
 }
