@@ -39,46 +39,76 @@ function fakeSession({ id, inheritedEventCount = 0, events = [], projections = {
   return {
     id,
     inheritedEventCount,
-    ownEvents: () => events.slice(inheritedEventCount),
+    events,
+    ownEvents: () => events.filter((event) => event.seq >= inheritedEventCount),
     projections,
   };
+}
+
+const USAGE_KEYS = ['tokenUsage', 'subagentCatalog'];
+
+/** The projection snapshot a fake Host folds for one Session. */
+function fakeSnapshot(session) {
+  const values = {};
+  for (const key of USAGE_KEYS) {
+    if (session.projections[key] !== undefined) values[key] = session.projections[key];
+  }
+  return { asOfSeq: 1, values };
 }
 
 /**
  * Build a fake Host service table.
  * @param sessions - session id → { session, running }.
  * @param options.live - ids reported as live.
+ * @param options.api - the read face the Host advertises: `observe` (this
+ *   Harness), `inspect` (an older callback read), or `replay` (`readSession`).
+ * @param options.disposed - collects the ids whose observation lease was released.
  */
-function fakeServices(sessions, { live = [] } = {}) {
+function fakeServices(sessions, { live = [], api = 'observe', disposed = [] } = {}) {
   const reads = [];
+  const find = (sessionId) => {
+    const entry = sessions[sessionId];
+    if (entry === undefined) {
+      const error = new Error(`session "${sessionId}" not found`);
+      error.code = 'SESSION_QUERY_SESSION_NOT_FOUND';
+      throw error;
+    }
+    return entry.session;
+  };
+  const faces = {
+    async observeSession(sessionId, options) {
+      reads.push(sessionId);
+      const session = find(sessionId);
+      return {
+        inheritedEventCount: session.inheritedEventCount,
+        events: session.events,
+        projections: options && options.projectionMode === 'all' ? fakeSnapshot(session) : undefined,
+        [Symbol.dispose]() {
+          disposed.push(sessionId);
+        },
+      };
+    },
+    async inspectSession(sessionId, read) {
+      reads.push(sessionId);
+      return read(find(sessionId));
+    },
+    async readSession(sessionId) {
+      reads.push(sessionId);
+      const session = find(sessionId);
+      return { session: { id: session.id }, inheritedEventCount: session.inheritedEventCount, events: session.events };
+    },
+  };
   const services = {
-    sessionQuery: {
-      inspectSession: async (sessionId, read) => {
-        reads.push(sessionId);
-        const entry = sessions[sessionId];
-        if (entry === undefined) {
-          const error = new Error(`session "${sessionId}" not found`);
-          error.code = 'SESSION_QUERY_SESSION_NOT_FOUND';
-          throw error;
-        }
-        return read(entry.session);
-      },
-    },
-    sessionProjections: {
-      snapshot: (session, keys) => {
-        const values = {};
-        for (const key of keys) {
-          if (session.projections[key] !== undefined) values[key] = session.projections[key];
-        }
-        return { asOfSeq: 1, values };
-      },
-    },
+    sessionQuery:
+      api === 'observe'
+        ? { observeSession: faces.observeSession }
+        : api === 'inspect'
+          ? { inspectSession: faces.inspectSession }
+          : { readSession: faces.readSession },
+    sessionProjections: { snapshot: (session) => fakeSnapshot(session) },
     sessions: { list: () => live.map((id) => ({ id })) },
   };
-  return {
-    getService: (name) => services[name],
-    reads,
-  };
+  return { getService: (name) => services[name], reads };
 }
 
 test('foldUsage prices a repeated attempt once and a retried attempt twice', () => {
@@ -141,8 +171,10 @@ test('isSessionId accepts Harness ids and rejects everything else', () => {
 });
 
 test('a seeded session is priced from its own events, not the inherited prefix', () => {
-  const prefix = [assistant(1, 1, sample(1000, 100))];
-  const own = [assistant(2, 1, sample(20, 2))];
+  // A seeded log carries the parent's prefix at the low seqs: `inheritedEventCount`
+  // is the count of those, so only events at or past it belong to this child.
+  const prefix = [{ type: 'assistant/message', seq: 0, data: { turn: 1, step: 1, usage: sample(1000, 100) } }];
+  const own = [{ type: 'assistant/message', seq: 1, data: { turn: 2, step: 1, usage: sample(20, 2) } }];
   const session = fakeSession({
     id: 'session-child',
     inheritedEventCount: 1,
@@ -240,9 +272,9 @@ test('the tree reply is cached inside TREE_TTL_MS and a cold node inside NODE_TT
   const wrapped = (name) => {
     if (name !== 'sessionQuery') return getService(name);
     return {
-      inspectSession: (sessionId, read) => {
+      observeSession: (sessionId, options) => {
         calls.push(sessionId);
-        return getService(name).inspectSession(sessionId, read);
+        return getService(name).observeSession(sessionId, options);
       },
     };
   };
@@ -274,6 +306,75 @@ test('a root without the usage projection reports no-usage', async () => {
   const reader = createSpendReader({ getService });
   const payload = await reader.read('session-empty');
   assert.deepEqual(payload, { ok: false, reason: 'no-usage' });
+});
+
+test('every observed node releases its observation lease', async () => {
+  const disposed = [];
+  const sessions = {
+    'session-root': {
+      session: fakeSession({
+        id: 'session-root',
+        projections: { tokenUsage: buckets(1, 1), subagentCatalog: [{ id: 'session-kid', mode: 'one-shot' }] },
+      }),
+    },
+    'session-kid': { session: fakeSession({ id: 'session-kid', projections: { tokenUsage: buckets(2, 2), subagentCatalog: [] } }) },
+  };
+  const { getService } = fakeServices(sessions, { disposed });
+  const reader = createSpendReader({ getService });
+  await reader.read('session-root');
+  assert.deepEqual(disposed, ['session-root', 'session-kid']);
+});
+
+test('a Host with only the callback read still walks the tree', async () => {
+  const sessions = {
+    'session-root': {
+      session: fakeSession({
+        id: 'session-root',
+        projections: { tokenUsage: buckets(1, 1), subagentCatalog: [{ id: 'session-kid', mode: 'one-shot' }] },
+      }),
+    },
+    'session-kid': { session: fakeSession({ id: 'session-kid', projections: { tokenUsage: buckets(2, 2), subagentCatalog: [] } }) },
+  };
+  const { getService } = fakeServices(sessions, { api: 'inspect' });
+  const reader = createSpendReader({ getService });
+  const payload = await reader.read('session-root');
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.totals, buckets(3, 3));
+});
+
+test('a Host with only readSession folds the usage out of the log', async () => {
+  seq = 0;
+  const sessions = {
+    'session-root': {
+      session: fakeSession({
+        id: 'session-root',
+        events: [assistant(1, 1, sample(10, 1)), assistant(1, 2, sample(20, 2))],
+        projections: {},
+      }),
+    },
+  };
+  const { getService } = fakeServices(sessions, { api: 'replay' });
+  const reader = createSpendReader({ getService });
+  const payload = await reader.read('session-root');
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.own, buckets(30, 3));
+});
+
+test('the child list comes from the service when no projection carries it', async () => {
+  const sessions = {
+    'session-root': { session: fakeSession({ id: 'session-root', projections: { tokenUsage: buckets(1, 1) } }) },
+    'session-kid': { session: fakeSession({ id: 'session-kid', projections: { tokenUsage: buckets(4, 2) } }) },
+  };
+  const { getService } = fakeServices(sessions);
+  const subagents = {
+    listChildren: async (sessionId) =>
+      sessionId === 'session-root' ? [{ id: 'session-kid', mode: 'one-shot', label: 'kid' }] : [],
+  };
+  const reader = createSpendReader({ getService: (name) => (name === 'subagents' ? subagents : getService(name)) });
+  const payload = await reader.read('session-root');
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.agents.map((agent) => agent.id), ['session-kid']);
+  assert.deepEqual(payload.totals, buckets(5, 3));
 });
 
 test('addBuckets is elementwise', () => {

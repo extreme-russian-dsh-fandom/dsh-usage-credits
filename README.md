@@ -39,7 +39,7 @@ Real numbers from a 13.9M-token session with a 99% cache hit rate: **¥0.65**, w
 
 A subagent is a separate DSH session with its own log, so this session's `tokenUsage` projection cannot see it. The pill therefore asks the Host for the whole tree:
 
-* the Host walks the durable `subagentCatalog` of the session, reads each child's `tokenUsage` through `ctx.sessionQuery.inspectSession` (no Agent is activated and no model call is made), and adds the four billing buckets up;
+* the Host walks the durable `subagentCatalog` of the session, reads each child's `tokenUsage` through `ctx.sessionQuery.observeSession` (an observation lease: no Agent is activated and no model call is made), and adds the four billing buckets up;
 * a cold child is read once and cached for 5 minutes; a finished tree reply is cached for 4 seconds;
 * a `subagent_fork` child is seeded with a prefix of its parent's log, and its own `tokenUsage` already includes that prefix — such a node is priced from its own log suffix only, so the parent's history is never counted twice;
 * external agents (ACP, Codex, Claude Code) have no local DSH log at all; the tooltip labels them as not measured instead of silently dropping them.

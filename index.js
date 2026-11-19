@@ -29,7 +29,7 @@ export function apply(ctx) {
   let cache;
 
   const clientOf = (url) => ({
-    version: '1.1.0',
+    version: '1.1.1',
     locale: url.searchParams.get('lang') || 'en',
     timezoneOffsetSeconds: Number(url.searchParams.get('tz')) || 0,
   });

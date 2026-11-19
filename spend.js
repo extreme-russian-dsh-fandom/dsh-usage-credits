@@ -9,13 +9,15 @@
  *
  * Two invariants shape the code:
  *
- * 1. Reading is observation only. `ctx.sessionQuery.inspectSession` restores a
- *    cold Session without activating an Agent and without a model call, and
- *    `ctx.sessionProjections.snapshot` folds the requested units at that cut.
+ * 1. Reading is observation only. `ctx.sessionQuery.observeSession` serves a
+ *    live Session or restores a cold one without activating an Agent and
+ *    without a model call, folding the requested projections at that cut; the
+ *    returned lease is disposed once the node is described. Older Harnesses
+ *    are read through `inspectSession(id, read)` or `readSession`.
  * 2. A fork child (`subagent_fork`) is seeded with a prefix of its parent's log,
  *    and the projection folds that inherited prefix too. Summing the child's
  *    `tokenUsage` as-is would count the parent's history twice, so a seeded node
- *    is priced from its own events only (`Session.ownEvents`).
+ *    is priced from its own events only (events at or past `inheritedEventCount`).
  *
  * The module is dependency-free so it can be unit-tested without a Harness.
  */
@@ -195,30 +197,106 @@ export function createSpendReader({ getService, now = Date.now, warn = () => {} 
     return !!(agent && agent.status === 'running');
   };
 
+  /** Release one observation lease: a leaked lease retains its Session. */
+  const release = (observation) => {
+    try {
+      if (typeof observation[Symbol.dispose] === 'function') observation[Symbol.dispose]();
+      else if (typeof observation.dispose === 'function') observation.dispose();
+    } catch (error) {
+      warn(`spend: observation release failed: ${String(error)}`);
+    }
+  };
+
+  /** The durable child list, used when the read carried no catalog projection. */
+  const childrenOf = async (sessionId) => {
+    const subagents = getService('subagents');
+    if (!subagents || typeof subagents.listChildren !== 'function') return [];
+    try {
+      return normalizeCatalog(await subagents.listChildren(sessionId));
+    } catch (error) {
+      warn(`spend: child listing failed for ${sessionId}: ${String(error)}`);
+      return [];
+    }
+  };
+
+  /**
+   * Fold one observed log cut into the node the walk consumes. A seeded node is
+   * priced from its own events only; a plain node prefers the projection and
+   * falls back to the log when the Host did not fold one.
+   */
+  const describeNode = (sessionId, inherited, snapshot, events) => {
+    const values = (snapshot && snapshot.values) || {};
+    const projected = normalizeBuckets(values.tokenUsage);
+    const usage = inherited > 0
+      ? foldUsage(events || [], inherited)
+      : projected ?? ((events || []).length > 0 ? foldUsage(events, 0) : null);
+    return {
+      id: sessionId,
+      asOfSeq: snapshot ? snapshot.asOfSeq : -1,
+      inherited,
+      usage,
+      catalog: snapshot && Array.isArray(values.subagentCatalog) ? normalizeCatalog(values.subagentCatalog) : null,
+      running: runningOf(sessionId),
+    };
+  };
+
+  /** Lift a node whose catalog came from the service rather than the projection. */
+  const withCatalog = async (node) =>
+    node === null || node.catalog !== null ? node : { ...node, catalog: await childrenOf(node.id) };
+
+  /**
+   * Read one node without activating its Agent. `observeSession` is the
+   * observation lease this Harness exposes: it serves a live Session or
+   * restores a persisted one, folds the requested projections, and makes no
+   * model call. Older builds named the same operation `inspectSession(id,
+   * read)`; a Host that advertises neither still gets a read from
+   * `readSession`, which replays the log without projections.
+   */
+  const observeNode = async (query, sessionId) => {
+    if (typeof query.observeSession === 'function') {
+      const observation = await query.observeSession(sessionId, { projectionMode: 'all' });
+      try {
+        const node = describeNode(
+          sessionId,
+          Number(observation.inheritedEventCount) || 0,
+          observation.projections,
+          observation.events,
+        );
+        return await withCatalog(node);
+      } finally {
+        release(observation);
+      }
+    }
+    if (typeof query.inspectSession === 'function') {
+      const projections = getService('sessionProjections');
+      const node = await query.inspectSession(sessionId, (session) =>
+        describeNode(
+          sessionId,
+          Number(session.inheritedEventCount) || 0,
+          projections && typeof projections.snapshot === 'function'
+            ? projections.snapshot(session, USAGE_KEYS)
+            : undefined,
+          typeof session.ownEvents === 'function' ? session.ownEvents() : [],
+        ),
+      );
+      return withCatalog(node);
+    }
+    if (typeof query.readSession === 'function') {
+      const log = await query.readSession(sessionId);
+      return withCatalog(describeNode(sessionId, Number(log.inheritedEventCount) || 0, undefined, log.events));
+    }
+    return null;
+  };
+
   const readNode = async (sessionId, liveIds) => {
     const query = getService('sessionQuery');
-    const projections = getService('sessionProjections');
-    if (!query || !projections) return null;
+    if (!query) return null;
     const live = liveIds.has(sessionId);
     if (!live) {
       const cached = nodes.get(sessionId);
       if (cached !== undefined && now() - cached.at < NODE_TTL_MS) return cached.node;
     }
-    const node = await query.inspectSession(sessionId, (session) => {
-      const snapshot = projections.snapshot(session, USAGE_KEYS);
-      const inherited = Number(session.inheritedEventCount) || 0;
-      const usage = inherited > 0
-        ? foldUsage(session.ownEvents())
-        : normalizeBuckets(snapshot.values.tokenUsage);
-      return {
-        id: sessionId,
-        asOfSeq: snapshot.asOfSeq,
-        inherited,
-        usage,
-        catalog: normalizeCatalog(snapshot.values.subagentCatalog),
-        running: runningOf(sessionId),
-      };
-    });
+    const node = await observeNode(query, sessionId);
     if (!live) {
       nodes.set(sessionId, { at: now(), node });
       prune(nodes, NODE_CACHE_LIMIT);
