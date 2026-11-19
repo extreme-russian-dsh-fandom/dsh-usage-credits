@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-credits",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "DSH plugin: API credit balance and cache-aware session spend including subagent trees, converted from CNY to USD and a chosen local currency at live exchange rates.",
@@ -44,7 +44,9 @@
     "LICENSE"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
