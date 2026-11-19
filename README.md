@@ -93,7 +93,7 @@ A payload is accepted only when `0.05 < $/¥ < 0.4`, it lists at least three cur
 Two transports, in order:
 
 1. `ctx.remote.account.getBalance()` — the same authenticated channel the Settings → Account page uses. Note that a dynamic client plugin cannot reach it through `ctx.remote.account` (the sandbox proxies the service, not the namespace tree); `ctx.get('remote.account')` is the working path, and the plugin also tolerates the namespace mounting late.
-2. A loopback route `/api-credits/balance` served by the Host half, guarded by a per-process token that the Host injects into the page it serves. Requests without the token get `403`.
+2. A loopback route `/api-credits/balance` served by the Host half, guarded by a per-process token that the Host injects into the page it serves. Browser requests without the token get `403`; the Desktop shell loads the UI from `dsh-app://app` and proxies its fetches through the main process, so those requests carry no `Origin`/`Sec-Fetch-Site` and are admitted without a token (see the guard comment in `index.js`).
 
 Either way the balance never leaves your machine: the browser talks to your local DSH host, which talks to the DeepSeek platform with your own credentials.
 

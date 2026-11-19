@@ -813,8 +813,8 @@ window.__ModuleLoader__.load({
         const run = (async () => {
           try {
             const token = typeof window !== 'undefined' ? window.__DSH_API_CREDITS_TOKEN__ : undefined;
-            if (!token) return;
-            const query = new URLSearchParams({ t: token, session: sessionId });
+            const query = new URLSearchParams({ session: sessionId });
+            if (token) query.set('t', token);
             const response = await fetch('/api-credits/spend?' + query.toString(), { cache: 'no-store' });
             if (!response.ok) {
               this.emit({ spendDiag: 'spend: HTTP ' + response.status });
@@ -966,20 +966,19 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Fallback transport: the Host route, guarded by the token the Host injected. */
+      /**
+       * Fallback transport: the Host route. A page served by the Host carries
+       * the guard token; the Desktop shell's proxy cannot, and its requests are
+       * admitted without one (see `authorized` in index.js).
+       */
       async readRouteBalance() {
         const token = typeof window !== 'undefined' ? window.__DSH_API_CREDITS_TOKEN__ : undefined;
-        if (!token) {
-          this.note('route: token missing');
-          this.emit({ balancePhase: 'error' });
-          return;
-        }
         try {
           const query = new URLSearchParams({
-            t: token,
             lang: this.language(),
             tz: String(-new Date().getTimezoneOffset() * 60),
           });
+          if (token) query.set('t', token);
           const response = await fetch('/api-credits/balance?' + query.toString(), { cache: 'no-store' });
           if (!response.ok) {
             this.note('route: HTTP ' + response.status);

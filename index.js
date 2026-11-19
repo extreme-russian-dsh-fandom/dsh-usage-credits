@@ -63,6 +63,21 @@ export function apply(ctx) {
     },
   });
 
+  /**
+   * Loopback guard. A page served by this Host gets the per-process token from
+   * the index tap. The Desktop shell instead loads the UI from `dsh-app://app`
+   * and proxies its fetches through the main process, so those requests carry
+   * neither `origin` nor `sec-fetch-site` and can never receive the token.
+   * Browser-initiated requests always carry `sec-fetch-site` (and a cross-site
+   * one carries `origin`), so they still need the token; a cross-origin reader
+   * is blocked by the missing CORS header in any case.
+   */
+  const authorized = (request, url) => {
+    if (url.searchParams.get('t') === token) return true;
+    const headers = request.headers || {};
+    return headers.origin === undefined && headers['sec-fetch-site'] === undefined;
+  };
+
   /** Shared request plumbing: method check, token check, and JSON framing. */
   const serveJson = async (request, response, produce) => {
     response.setHeader('cache-control', 'no-store');
@@ -79,7 +94,7 @@ export function apply(ctx) {
       response.end();
       return;
     }
-    if (url.searchParams.get('t') !== token) {
+    if (!authorized(request, url)) {
       response.statusCode = 403;
       response.end('forbidden');
       return;
@@ -116,12 +131,13 @@ export function apply(ctx) {
     ctx.webServer.register({
       kind: 'exact',
       path: SPEND_ROUTE,
-      handler: (request, response) =>
-        serveJson(request, response, async (url) => {
+      handler: (request, response) => {
+        return serveJson(request, response, async (url) => {
           const sessionId = url.searchParams.get('session');
           if (!isSessionId(sessionId)) return { ok: false, reason: 'bad-session' };
           return spend.read(sessionId);
-        }),
+        });
+      },
     }),
   );
 
