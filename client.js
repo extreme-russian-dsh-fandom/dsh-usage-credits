@@ -60,6 +60,7 @@ window.__ModuleLoader__.load({
         spendLocal: 'Local',
         spendTopUp: 'Top-up',
         subagents: 'Subagents',
+        agent: 'Agent',
         sessionSubtotal: 'This session',
         subagentsSubtotal: 'Subagents total',
         otherAgents: 'Other agents',
@@ -104,6 +105,7 @@ window.__ModuleLoader__.load({
         spendLocal: 'Локальная',
         spendTopUp: 'Пополнение',
         subagents: 'Субагенты',
+        agent: 'Агент',
         sessionSubtotal: 'Своя сессия',
         subagentsSubtotal: 'Итого субагенты',
         otherAgents: 'Остальные агенты',
@@ -148,6 +150,7 @@ window.__ModuleLoader__.load({
         spendLocal: '本地货币',
         spendTopUp: '充值货币',
         subagents: '子代理',
+        agent: '代理',
         sessionSubtotal: '本会话',
         subagentsSubtotal: '子代理合计',
         otherAgents: '其他代理',
@@ -569,12 +572,17 @@ window.__ModuleLoader__.load({
       return String(value);
     }
 
-    /** One agent's readable label: its name, its catalog label, then a short id. */
-    function agentLabel(agent) {
-      if (agent && typeof agent.name === 'string' && agent.name !== '') return agent.name;
+    /** A child's display title: its catalog label, else its name, else a short id. */
+    function agentTitle(agent) {
       if (agent && typeof agent.label === 'string' && agent.label !== '') return agent.label;
+      if (agent && typeof agent.name === 'string' && agent.name !== '') return agent.name;
       const id = agent && typeof agent.id === 'string' ? agent.id : '';
       return id.indexOf('session-') === 0 ? id.slice(8, 16) : id.slice(0, 8);
+    }
+
+    /** Tooltip rows stay one line; a long self-written task title is clipped. */
+    function clip(text, limit = 40) {
+      return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
     }
 
     /** Fold every child's four buckets into one raw usage object. */
@@ -626,10 +634,11 @@ window.__ModuleLoader__.load({
       const rawLocal = rate && rate.rates ? rate.rates[localCode] : undefined;
       const localRate = Number.isFinite(rawLocal) && rawLocal > 0 ? rawLocal : null;
       if (!rate) {
-        return { wallets, cnyAmount, usdAmount, cny: null, usd: null, local: null, localRate, localCode };
+        return { rate: null, wallets, cnyAmount, usdAmount, cny: null, usd: null, local: null, localRate, localCode };
       }
       const cny = cnyAmount + (rate.usdPerCny > 0 ? usdAmount / rate.usdPerCny : 0);
       return {
+        rate,
         wallets,
         cnyAmount,
         usdAmount,
@@ -894,7 +903,7 @@ window.__ModuleLoader__.load({
 
       clientMeta() {
         return {
-          version: '1.0.0',
+          version: '1.1.1',
           locale: this.language(),
           timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
         };
@@ -1305,8 +1314,14 @@ window.__ModuleLoader__.load({
             value: formatCost(agentCost, currency, localeTag),
           }),
         );
-        for (const row of shownRows) {
-          tip.push(h(TipRow, { key: 'agent:' + row.agent.id, label: agentLabel(row.agent), value: formatCost(row.value, currency, localeTag) }));
+        for (const [index, row] of shownRows.entries()) {
+          tip.push(
+            h(TipRow, {
+              key: 'agent:' + row.agent.id,
+              label: t('agent') + ' ' + (index + 1) + ': ' + clip(agentTitle(row.agent)),
+              value: formatCost(row.value, currency, localeTag),
+            }),
+          );
         }
         if (agentRows.length > shownRows.length) {
           tip.push(
@@ -1341,6 +1356,7 @@ window.__ModuleLoader__.load({
           t('tariff') + ' ' + family.id + ' · ' + (totalsBuckets.peak ? t('peak') : t('offPeak')),
         ),
       );
+      if (state.spendDiag) tip.push(h('div', { className: 'dshac-tipNote', key: 'diag' }, state.spendDiag));
 
       return h(
         'span',
@@ -1594,7 +1610,7 @@ window.__ModuleLoader__.load({
 .dshac-tipInline{position:absolute;left:0;bottom:calc(100% + 8px);z-index:30}
 .dshac-tipTitle{margin-bottom:6px;color:var(--dsw-alias-label-primary);font-weight:500}
 .dshac-tipRow{display:flex;justify-content:space-between;gap:16px;padding:2px 0}
-.dshac-tipKey{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}
+.dshac-tipKey{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dshac-tipVal{font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere}
 .dshac-tipRule{border-top:.5px solid var(--dsw-alias-border-l2,var(--dsw-alias-border-l1));margin:6px 0}
 .dshac-tipNote{margin-top:6px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;line-height:16px}
